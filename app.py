@@ -22,6 +22,13 @@ PORT = 8000
 ASSET_TEMPLATE = os.path.join(os.path.dirname(__file__), "assets", "inventory_export_1.csv")
 TARGET_LOCATION = "Furniture of America"
 NOT_STOCKED = "not stocked"
+REMOVED_OUTPUT_COLUMNS = {
+    "Incoming (not editable)",
+    "Unavailable (not editable)",
+    "Committed (not editable)",
+    "Available (not editable)",
+    "On hand (current)",
+}
 
 SKU_KEYWORDS = ("sku", "itemcode", "item code", "item", "product code", "product")
 QTY_EXACT = ("qty", "quantity", "qty now", "stock qty", "available qty", "on hand qty")
@@ -300,7 +307,8 @@ def load_asset_rows(asset_file: tuple[str, bytes] | None) -> tuple[list[dict[str
     if not fieldnames:
         raise ValueError("Asset template has no header row.")
 
-    return rows, fieldnames
+    output_fieldnames = [name for name in fieldnames if name not in REMOVED_OUTPUT_COLUMNS]
+    return rows, output_fieldnames
 
 
 def build_updated_inventory_csv(
@@ -320,7 +328,7 @@ def build_updated_inventory_csv(
             available_value = normalize_text(row.get("Available (not editable)"))
             if available_value != NOT_STOCKED:
                 row["On hand (new)"] = format_qty_for_export(totals.get(sku, 0.0))
-        writer.writerow(row)
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
 
     return output.getvalue().encode("utf-8-sig")
 
