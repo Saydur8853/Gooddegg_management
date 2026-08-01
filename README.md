@@ -23,6 +23,16 @@ python app.py
 
 Then open `http://127.0.0.1:8000`
 
+## Shopify orders
+
+- Open `http://127.0.0.1:8000/orders`
+- The app reads Shopify domain/client credentials from:
+  - local `.env`
+  - or sibling project `../Gooddegg_order_management/.env`
+- Click `Connect Shopify` once to complete OAuth
+- After success, the Shopify access token is saved in this project's local `.env`
+- Click `Load latest orders` to see the latest 20 Shopify orders
+
 ## What it does
 
 - Upload two or more inventory files

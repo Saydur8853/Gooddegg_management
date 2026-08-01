@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import csv
 import html
+import hashlib
+import hmac
 import io
+import json
 import os
 import re
 from collections import defaultdict
@@ -12,6 +15,7 @@ from email.policy import default
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
+from urllib import error, parse, request
 
 import xlrd
 from openpyxl import Workbook, load_workbook
@@ -22,6 +26,18 @@ PORT = 8000
 ASSET_TEMPLATE = os.path.join(os.path.dirname(__file__), "assets", "inventory_export_1.csv")
 TARGET_LOCATION = "Furniture of America"
 NOT_STOCKED = "not stocked"
+MIN_EXPORT_QTY = 3
+ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+SIBLING_ENV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "Gooddegg_order_management",
+    ".env",
+)
+SHOPIFY_DEFAULT_API_VERSION = "2025-10"
+SHOPIFY_SCOPES = "read_orders"
+SHOPIFY_STATE_KEY = "shopify_oauth_state"
+SHOPIFY_TOKEN_KEY = "SHOPIFY_ADMIN_ACCESS_TOKEN"
+SHOPIFY_ORDERS_LIMIT = 20
 REMOVED_OUTPUT_COLUMNS = {
     "Incoming (not editable)",
     "Unavailable (not editable)",
@@ -33,6 +49,169 @@ REMOVED_OUTPUT_COLUMNS = {
 SKU_KEYWORDS = ("sku", "itemcode", "item code", "item", "product code", "product")
 QTY_EXACT = ("qty", "quantity", "qty now", "stock qty", "available qty", "on hand qty")
 QTY_PARTIAL = ("qty", "quantity", "stock", "on hand", "available")
+SHOPIFY_RUNTIME_STATE: dict[str, str] = {}
+
+
+def load_dotenv_file(path: str) -> dict[str, str]:
+    if not os.path.exists(path):
+        return {}
+
+    values: dict[str, str] = {}
+    with open(path, encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+
+    return values
+
+
+def load_shopify_settings() -> dict[str, str]:
+    settings: dict[str, str] = {}
+    for candidate in (SIBLING_ENV_PATH, ENV_PATH):
+        settings.update(load_dotenv_file(candidate))
+
+    return {
+        "shop_domain": settings.get("SHOPIFY_SHOP_DOMAIN", "").strip(),
+        "api_version": settings.get("SHOPIFY_API_VERSION", SHOPIFY_DEFAULT_API_VERSION).strip() or SHOPIFY_DEFAULT_API_VERSION,
+        "client_id": settings.get("SHOPIFY_CLIENT_ID", "").strip(),
+        "client_secret": settings.get("SHOPIFY_CLIENT_SECRET", "").strip(),
+        "admin_access_token": settings.get(SHOPIFY_TOKEN_KEY, "").strip(),
+    }
+
+
+def save_env_value(path: str, key: str, value: str) -> None:
+    lines: list[str] = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+
+    updated = False
+    for index, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[index] = f"{key}={value}"
+            updated = True
+            break
+
+    if not updated:
+        lines.append(f"{key}={value}")
+
+    content = "\n".join(lines).rstrip() + "\n"
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+
+
+def normalize_shop_domain(value: str) -> str:
+    sanitized = value.strip()
+    sanitized = sanitized.replace("https://", "")
+    sanitized = sanitized.replace("http://", "")
+    sanitized = sanitized.strip("/")
+    if sanitized and "." not in sanitized:
+        sanitized = f"{sanitized}.myshopify.com"
+    return sanitized
+
+
+def shopify_redirect_uri() -> str:
+    return f"http://{HOST}:{PORT}/shopify/callback"
+
+
+def build_shopify_authorization_url(settings: dict[str, str], state: str) -> str:
+    params = parse.urlencode(
+        {
+            "client_id": settings["client_id"],
+            "scope": SHOPIFY_SCOPES,
+            "redirect_uri": shopify_redirect_uri(),
+            "state": state,
+        }
+    )
+    return f"https://{normalize_shop_domain(settings['shop_domain'])}/admin/oauth/authorize?{params}"
+
+
+def validate_shopify_hmac(query_params: dict[str, str], client_secret: str) -> bool:
+    received_hmac = query_params.get("hmac", "").strip().lower()
+    if not received_hmac:
+        return False
+
+    message_parts = []
+    for key in sorted(query_params):
+        if key in {"hmac", "signature"}:
+            continue
+        message_parts.append(f"{key}={query_params[key]}")
+
+    message = "&".join(message_parts).encode("utf-8")
+    digest = hmac.new(client_secret.encode("utf-8"), message, hashlib.sha256).hexdigest().lower()
+    return hmac.compare_digest(digest, received_hmac)
+
+
+def exchange_shopify_code_for_token(settings: dict[str, str], code: str) -> str:
+    url = f"https://{normalize_shop_domain(settings['shop_domain'])}/admin/oauth/access_token"
+    payload = parse.urlencode(
+        {
+            "client_id": settings["client_id"],
+            "client_secret": settings["client_secret"],
+            "code": code,
+        }
+    ).encode("utf-8")
+
+    req = request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with request.urlopen(req, timeout=30) as response:
+            body = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"Token exchange failed: {details or exc.reason}") from exc
+
+    data = json.loads(body)
+    token = str(data.get("access_token", "")).strip()
+    if not token:
+        raise ValueError("Shopify response did not include an access token.")
+    return token
+
+
+def fetch_shopify_orders(settings: dict[str, str], limit: int = SHOPIFY_ORDERS_LIMIT) -> list[dict[str, str]]:
+    token = settings.get("admin_access_token", "").strip()
+    if not token:
+        raise ValueError("Shopify access token is missing.")
+
+    domain = normalize_shop_domain(settings["shop_domain"])
+    api_version = settings.get("api_version", SHOPIFY_DEFAULT_API_VERSION) or SHOPIFY_DEFAULT_API_VERSION
+    url = f"https://{domain}/admin/api/{api_version}/orders.json?status=any&limit={max(1, min(limit, 250))}"
+
+    req = request.Request(url, method="GET")
+    req.add_header("Accept", "application/json")
+    req.add_header("X-Shopify-Access-Token", token)
+
+    try:
+        with request.urlopen(req, timeout=30) as response:
+            body = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"Shopify API error: {details or exc.reason}") from exc
+
+    payload = json.loads(body)
+    orders = payload.get("orders", [])
+    result: list[dict[str, str]] = []
+    for order in orders:
+        customer = order.get("customer") or {}
+        first_name = str(customer.get("first_name", "")).strip()
+        last_name = str(customer.get("last_name", "")).strip()
+        customer_name = f"{first_name} {last_name}".strip() or "N/A"
+        result.append(
+            {
+                "name": str(order.get("name", "")).strip() or "N/A",
+                "customer": customer_name,
+                "total_price": str(order.get("total_price", "")).strip() or "N/A",
+                "currency": str(order.get("currency", "")).strip() or "",
+                "financial_status": str(order.get("financial_status", "")).strip() or "N/A",
+                "fulfillment_status": str(order.get("fulfillment_status", "")).strip() or "unfulfilled",
+                "created_at": str(order.get("created_at", "")).strip() or "N/A",
+            }
+        )
+    return result
 
 
 def normalize_text(value: object) -> str:
@@ -327,7 +506,10 @@ def build_updated_inventory_csv(
         if location == TARGET_LOCATION:
             available_value = normalize_text(row.get("Available (not editable)"))
             if available_value != NOT_STOCKED:
-                row["On hand (new)"] = format_qty_for_export(totals.get(sku, 0.0))
+                quantity = totals.get(sku, 0.0)
+                if quantity < MIN_EXPORT_QTY:
+                    quantity = 0.0
+                row["On hand (new)"] = format_qty_for_export(quantity)
         writer.writerow({key: row.get(key, "") for key in fieldnames})
 
     return output.getvalue().encode("utf-8-sig")
@@ -526,7 +708,237 @@ def render_home(message: str = "") -> bytes:
         </div>
         <button type="submit">Generate Updated Export</button>
       </form>
-      <div class="meta">Default base file: <strong>assets/inventory_export_1.csv</strong></div>
+      <div class="meta">Default base file: <strong>assets/inventory_export_1.csv</strong><br><a href="/orders">Open Shopify order list</a></div>
+    </div>
+  </div>
+</body>
+</html>"""
+    return html_body.encode("utf-8")
+
+
+def render_orders_page(message: str = "", message_kind: str = "", orders: list[dict[str, str]] | None = None) -> bytes:
+    settings = load_shopify_settings()
+    token_ready = bool(settings["admin_access_token"])
+    escaped_message = html.escape(message)
+    badge = "Connected" if token_ready else "Not connected"
+    badge_class = "ok" if token_ready else "warn"
+    rows = ""
+    for order in orders or []:
+        rows += (
+            "<tr>"
+            f"<td>{html.escape(order['name'])}</td>"
+            f"<td>{html.escape(order['customer'])}</td>"
+            f"<td>{html.escape(order['total_price'])} {html.escape(order['currency'])}</td>"
+            f"<td>{html.escape(order['financial_status'])}</td>"
+            f"<td>{html.escape(order['fulfillment_status'])}</td>"
+            f"<td>{html.escape(order['created_at'])}</td>"
+            "</tr>"
+        )
+
+    if not rows:
+        rows = '<tr><td colspan="6">No orders loaded yet.</td></tr>'
+
+    html_body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shopify Orders</title>
+  <style>
+    :root {{
+      --bg: #f6f4ef;
+      --panel: rgba(255,255,255,0.88);
+      --text: #221d16;
+      --muted: #6d655d;
+      --line: rgba(34,29,22,0.1);
+      --accent: #6c4b2b;
+      --accent-soft: #f3ebe1;
+      --ok: #2b6b3f;
+      --warn: #9a5a18;
+      --error: #9b3b34;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top right, rgba(108, 75, 43, 0.10), transparent 25%),
+        linear-gradient(180deg, #fbfaf7 0%, #f3efe8 100%);
+    }}
+    .wrap {{
+      min-height: 100vh;
+      padding: 28px 18px 40px;
+    }}
+    .panel {{
+      width: min(1080px, 100%);
+      margin: 0 auto;
+      background: var(--panel);
+      border: 1px solid rgba(255,255,255,0.7);
+      border-radius: 28px;
+      padding: 28px;
+      box-shadow: 0 18px 50px rgba(40, 30, 18, 0.08);
+      backdrop-filter: blur(10px);
+    }}
+    .topbar {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }}
+    .topbar a {{
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+    }}
+    .badge {{
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      font-size: 0.85rem;
+      font-weight: 700;
+    }}
+    .badge.ok {{ color: var(--ok); }}
+    .badge.warn {{ color: var(--warn); }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: clamp(2rem, 5vw, 3rem);
+      letter-spacing: -0.04em;
+    }}
+    .intro {{
+      margin: 0 0 18px;
+      color: var(--muted);
+      line-height: 1.6;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }}
+    .card {{
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      background: rgba(255,255,255,0.75);
+    }}
+    .card strong {{
+      display: block;
+      margin-bottom: 6px;
+      font-size: 0.9rem;
+    }}
+    .card span {{
+      color: var(--muted);
+      word-break: break-word;
+    }}
+    .actions {{
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }}
+    .button {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 0 18px;
+      border-radius: 16px;
+      background: var(--accent);
+      color: white;
+      text-decoration: none;
+      font-weight: 700;
+      box-shadow: 0 10px 24px rgba(108, 75, 43, 0.18);
+    }}
+    .button.secondary {{
+      background: white;
+      color: var(--accent);
+      border: 1px solid var(--line);
+      box-shadow: none;
+    }}
+    .note {{
+      margin-bottom: 18px;
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.7);
+      color: var(--muted);
+    }}
+    .note.error {{ color: var(--error); }}
+    .note.ok {{ color: var(--ok); }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 18px;
+      background: white;
+    }}
+    th, td {{
+      padding: 14px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      font-size: 0.95rem;
+      vertical-align: top;
+    }}
+    th {{
+      background: #f8f3ec;
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }}
+    @media (max-width: 720px) {{
+      .panel {{ padding: 22px; border-radius: 22px; }}
+      table, thead, tbody, th, td, tr {{ display: block; }}
+      thead {{ display: none; }}
+      tr {{
+        border-bottom: 1px solid var(--line);
+        padding: 8px 0;
+      }}
+      td {{
+        border: 0;
+        padding: 8px 0;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <div class="topbar">
+        <a href="/">Back to inventory app</a>
+        <span class="badge {badge_class}">{badge}</span>
+      </div>
+      <h1>Shopify order list</h1>
+      <p class="intro">This page uses your existing Gooddegg Shopify app credentials. Connect once, then load the latest {SHOPIFY_ORDERS_LIMIT} orders directly from Shopify Admin API.</p>
+      <div class="grid">
+        <div class="card"><strong>Shop Domain</strong><span>{html.escape(settings["shop_domain"] or "Not found")}</span></div>
+        <div class="card"><strong>API Version</strong><span>{html.escape(settings["api_version"])}</span></div>
+        <div class="card"><strong>Client ID</strong><span>{html.escape(settings["client_id"] or "Not found")}</span></div>
+        <div class="card"><strong>Token Status</strong><span>{"Saved in local .env" if token_ready else "Not saved yet"}</span></div>
+      </div>
+      <div class="actions">
+        <a class="button" href="/shopify/connect">Connect Shopify</a>
+        <a class="button secondary" href="/orders?refresh=1">Load latest orders</a>
+      </div>
+      <div class="note {html.escape(message_kind)}">{escaped_message or "If token is missing, click Connect Shopify first. After successful connection, the access token will be saved in this project's .env file."}</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th>Customer</th>
+            <th>Total</th>
+            <th>Payment</th>
+            <th>Fulfillment</th>
+            <th>Created</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
     </div>
   </div>
 </body>
@@ -574,12 +986,95 @@ def parse_uploaded_files(
 
 class InventoryHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        body = render_home()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        parsed_url = parse.urlparse(self.path)
+
+        if parsed_url.path == "/":
+            body = render_home()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if parsed_url.path == "/orders":
+            query = parse.parse_qs(parsed_url.query)
+            message = ""
+            message_kind = ""
+            orders: list[dict[str, str]] = []
+            if "connected" in query:
+                message = "Shopify connected successfully. You can load the latest orders now."
+                message_kind = "ok"
+
+            if "refresh" in query:
+                try:
+                    orders = fetch_shopify_orders(load_shopify_settings())
+                    message = f"Loaded {len(orders)} orders from Shopify."
+                    message_kind = "ok"
+                except Exception as exc:
+                    message = str(exc)
+                    message_kind = "error"
+
+            body = render_orders_page(message=message, message_kind=message_kind, orders=orders)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if parsed_url.path == "/shopify/connect":
+            settings = load_shopify_settings()
+            if not settings["shop_domain"] or not settings["client_id"] or not settings["client_secret"]:
+                body = render_orders_page(
+                    message="Shopify domain, client ID, or client secret was not found in config.",
+                    message_kind="error",
+                )
+                self.send_response(HTTPStatus.BAD_REQUEST)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            state = hashlib.sha256(os.urandom(32)).hexdigest()
+            SHOPIFY_RUNTIME_STATE[SHOPIFY_STATE_KEY] = state
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", build_shopify_authorization_url(settings, state))
+            self.end_headers()
+            return
+
+        if parsed_url.path == "/shopify/callback":
+            query = {key: values[-1] for key, values in parse.parse_qs(parsed_url.query).items()}
+            settings = load_shopify_settings()
+
+            try:
+                expected_state = SHOPIFY_RUNTIME_STATE.get(SHOPIFY_STATE_KEY, "")
+                if not expected_state or query.get("state", "") != expected_state:
+                    raise ValueError("OAuth state mismatch. Please try connecting again.")
+                if not validate_shopify_hmac(query, settings["client_secret"]):
+                    raise ValueError("Invalid Shopify callback signature.")
+                code = query.get("code", "").strip()
+                if not code:
+                    raise ValueError("Shopify callback did not include an authorization code.")
+
+                token = exchange_shopify_code_for_token(settings, code)
+                save_env_value(ENV_PATH, SHOPIFY_TOKEN_KEY, token)
+                SHOPIFY_RUNTIME_STATE.pop(SHOPIFY_STATE_KEY, None)
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", "/orders?connected=1")
+                self.end_headers()
+                return
+            except Exception as exc:
+                body = render_orders_page(message=str(exc), message_kind="error")
+                self.send_response(HTTPStatus.BAD_REQUEST)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+        self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
         try:
