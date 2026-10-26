@@ -8,6 +8,9 @@ import io
 import json
 import os
 import re
+import sys
+import threading
+import webbrowser
 from collections import defaultdict
 from datetime import datetime
 from email.parser import BytesParser
@@ -23,13 +26,22 @@ from openpyxl import Workbook, load_workbook
 
 HOST = "127.0.0.1"
 PORT = 8000
-ASSET_TEMPLATE = os.path.join(os.path.dirname(__file__), "assets", "inventory_export_1.csv")
+RUNTIME_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+BUNDLE_DIR = getattr(sys, "_MEIPASS", RUNTIME_DIR)
+ASSET_TEMPLATE = os.path.join(BUNDLE_DIR, "assets", "inventory_export_1.csv")
+BUTLER_ASSET_TEMPLATE = os.path.join(BUNDLE_DIR, "assets", "merged_inventory_export.csv")
+BUTLER_EXTERNAL_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.dirname(BUNDLE_DIR)),
+    "test FOA",
+    "Butler",
+    "merged_inventory_export.csv",
+)
 TARGET_LOCATION = "Furniture of America"
 NOT_STOCKED = "not stocked"
-MIN_EXPORT_QTY = 3
-ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+MIN_EXPORT_QTY = 5
+ENV_PATH = os.path.join(RUNTIME_DIR, ".env")
 SIBLING_ENV_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
+    os.path.dirname(RUNTIME_DIR),
     "Gooddegg_order_management",
     ".env",
 )
@@ -493,7 +505,13 @@ def load_asset_rows(asset_file: tuple[str, bytes] | None) -> tuple[list[dict[str
 def build_updated_inventory_csv(
     totals: dict[str, float],
     asset_file: tuple[str, bytes] | None = None,
+    template_path: str | None = None,
+    target_location: str | None = TARGET_LOCATION,
+    minimum_quantity: float = MIN_EXPORT_QTY,
 ) -> bytes:
+    if asset_file is None and template_path is not None:
+        with open(template_path, "rb") as handle:
+            asset_file = (os.path.basename(template_path), handle.read())
     rows, fieldnames = load_asset_rows(asset_file)
 
     output = io.StringIO()
@@ -502,14 +520,16 @@ def build_updated_inventory_csv(
 
     for row in rows:
         location = clean_sku(row.get("Location"))
+        if target_location is not None and location != target_location:
+            continue
+
         sku = clean_sku(row.get("SKU"))
-        if location == TARGET_LOCATION:
-            available_value = normalize_text(row.get("Available (not editable)"))
-            if available_value != NOT_STOCKED:
-                quantity = totals.get(sku, 0.0)
-                if quantity < MIN_EXPORT_QTY:
-                    quantity = 0.0
-                row["On hand (new)"] = format_qty_for_export(quantity)
+        available_value = normalize_text(row.get("Available (not editable)"))
+        if target_location is None or available_value != NOT_STOCKED:
+            quantity = totals.get(sku, 0.0)
+            if quantity < minimum_quantity:
+                quantity = 0.0
+            row["On hand (new)"] = format_qty_for_export(quantity)
         writer.writerow({key: row.get(key, "") for key in fieldnames})
 
     return output.getvalue().encode("utf-8-sig")
@@ -536,8 +556,20 @@ def build_summary_workbook(totals: dict[str, float]) -> bytes:
     return output.read()
 
 
-def render_home(message: str = "") -> bytes:
+def render_home(message: str = "", mode: str = "foa") -> bytes:
     escaped_message = html.escape(message)
+    is_butler = mode == "butler"
+    page_title = "Butler Inventory" if is_butler else "FOA Inventory"
+    intro = (
+        "Upload the Butler specialty product inventory CSV. Product is matched to SKU and Available is written to On hand (new)."
+        if is_butler
+        else "Upload your report files and generate the final CSV for Furniture of America. Mixed <strong>CSV</strong>, <strong>XLSX</strong>, and <strong>XLS</strong> files are supported."
+    )
+    upload_help = "Select the Butler specialty product inventory CSV." if is_butler else "Select two or more inventory reports."
+    upload_name = "butler_inventory_file" if is_butler else "inventory_files"
+    upload_multiple = "" if is_butler else " multiple"
+    action = "/butler" if is_butler else "/"
+    template_label = "assets/merged_inventory_export.csv" if is_butler else "assets/inventory_export_1.csv"
     html_body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -569,8 +601,62 @@ def render_home(message: str = "") -> bytes:
     .wrap {{
       min-height: 100vh;
       display: grid;
-      place-items: center;
+      grid-template-columns: 230px minmax(0, 720px);
+      align-items: center;
+      justify-content: center;
+      gap: 24px;
       padding: 32px 18px;
+    }}
+    .sidebar {{
+      align-self: stretch;
+      min-height: 620px;
+      padding: 24px 14px;
+      border: 1px solid rgba(255,255,255,0.7);
+      border-radius: 24px;
+      background: rgba(255,255,255,0.7);
+      box-shadow: 0 18px 50px rgba(28, 42, 35, 0.06);
+      backdrop-filter: blur(14px);
+    }}
+    .brand {{
+      padding: 8px 12px 24px;
+      color: var(--accent);
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }}
+    .menu-title {{
+      padding: 0 12px 10px;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }}
+    .menu-item {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 14px;
+      color: var(--accent);
+      font-weight: 600;
+      text-decoration: none;
+    }}
+    .menu-item.active {{
+      background: var(--accent-soft);
+    }}
+    .menu-icon {{
+      display: grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border-radius: 9px;
+      background: var(--accent);
+      color: white;
+      font-size: 0.78rem;
+    }}
+    .content {{
+      width: 100%;
     }}
     .panel {{
       width: min(720px, 100%);
@@ -675,7 +761,12 @@ def render_home(message: str = "") -> bytes:
     }}
     @media (max-width: 720px) {{
       .wrap {{
+        grid-template-columns: 1fr;
+        align-items: start;
         padding: 18px 14px;
+      }}
+      .sidebar {{
+        min-height: auto;
       }}
       .panel {{
         padding: 24px;
@@ -686,30 +777,37 @@ def render_home(message: str = "") -> bytes:
 </head>
 <body>
   <div class="wrap">
-    <div class="panel">
-      <span class="label">Inventory Process</span>
-      <h1>Update stock export</h1>
-      <p class="intro">Upload your report files and generate the final CSV for Furniture of America. Mixed <strong>CSV</strong>, <strong>XLSX</strong>, and <strong>XLS</strong> files are supported.</p>
-      <div class="note {('error' if message else '')}">{escaped_message or 'Stocked SKUs are updated from merged totals. Rows marked not stocked stay blank.'}</div>
-      <form method="post" enctype="multipart/form-data">
-        <div class="upload-zone">
-          <div class="upload-meta">
-            <strong>Source files</strong>
-            <span>Select two or more inventory reports.</span>
+    <aside class="sidebar">
+      <div class="brand">Gooddegg Management</div>
+      <div class="menu-title">Menu</div>
+      <a class="menu-item {'active' if not is_butler else ''}" href="/">
+        <span class="menu-icon">F</span>
+        <span>FOA Inventory</span>
+      </a>
+      <a class="menu-item {'active' if is_butler else ''}" href="/butler">
+        <span class="menu-icon">B</span>
+        <span>Butler Inventory</span>
+      </a>
+    </aside>
+    <main class="content">
+      <div class="panel">
+        <span class="label">Inventory Process</span>
+        <h1>{page_title}</h1>
+        <p class="intro">{intro}</p>
+        <div class="note {('error' if message else '')}">{escaped_message or 'Stocked SKUs are updated from merged totals. Rows marked not stocked stay blank.'}</div>
+        <form method="post" action="{action}" enctype="multipart/form-data">
+          <div class="upload-zone">
+            <div class="upload-meta">
+              <strong>Source files</strong>
+              <span>{upload_help}</span>
+            </div>
+            <input type="file" name="{upload_name}" accept=".csv,.xlsx,.xls"{upload_multiple} required>
           </div>
-          <input type="file" name="inventory_files" accept=".csv,.xlsx,.xls" multiple required>
-        </div>
-        <div class="upload-zone">
-          <div class="upload-meta">
-            <strong>Asset export file</strong>
-            <span>Optional. Upload a different export CSV if you want to replace the default base file.</span>
-          </div>
-          <input type="file" name="asset_file" accept=".csv">
-        </div>
-        <button type="submit">Generate Updated Export</button>
-      </form>
-      <div class="meta">Default base file: <strong>assets/inventory_export_1.csv</strong><br><a href="/orders">Open Shopify order list</a></div>
-    </div>
+          <button type="submit">Generate {'Butler' if is_butler else 'Updated'} Export</button>
+        </form>
+        <div class="meta">Default base file: <strong>{template_label}</strong><br><a href="/orders">Open Shopify order list</a></div>
+      </div>
+    </main>
   </div>
 </body>
 </html>"""
@@ -978,6 +1076,8 @@ def parse_uploaded_files(
 
         if field_name == "inventory_files":
             files.append((filename, content))
+        elif field_name == "butler_inventory_file":
+            files.append((filename, content))
         elif field_name == "asset_file":
             asset_file = (filename, content)
 
@@ -988,8 +1088,8 @@ class InventoryHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed_url = parse.urlparse(self.path)
 
-        if parsed_url.path == "/":
-            body = render_home()
+        if parsed_url.path in ("/", "/butler"):
+            body = render_home(mode="butler" if parsed_url.path == "/butler" else "foa")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1079,17 +1179,40 @@ class InventoryHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             files, asset_file = parse_uploaded_files(self)
+            is_butler = parse.urlparse(self.path).path == "/butler"
 
-            if len(files) < 2:
+            if is_butler and len(files) != 1:
+                raise ValueError("Please upload one Butler inventory CSV file.")
+            if not is_butler and len(files) < 2:
                 raise ValueError("Please upload at least two inventory files.")
 
             totals = merge_inventory(files)
             if not totals:
                 raise ValueError("No SKU records were found in the uploaded files.")
 
-            output_bytes = build_updated_inventory_csv(totals, asset_file=asset_file)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_name = f"inventory_export_updated_{timestamp}.csv"
+            if is_butler:
+                template_path = next(
+                    (
+                        path
+                        for path in (BUTLER_EXTERNAL_TEMPLATE, BUTLER_ASSET_TEMPLATE)
+                        if os.path.exists(path)
+                    ),
+                    None,
+                )
+                if template_path is None:
+                    raise ValueError("Butler base file merged_inventory_export.csv was not found.")
+                output_bytes = build_updated_inventory_csv(
+                    totals,
+                    template_path=template_path,
+                    target_location=None,
+                    minimum_quantity=0,
+                )
+                today = datetime.now()
+                output_name = f"Butler_inventory_{today.day}_{today.strftime('%b').lower()}_{today.year}.csv"
+            else:
+                output_bytes = build_updated_inventory_csv(totals, asset_file=asset_file)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_name = f"inventory_export_updated_{timestamp}.csv"
 
             self.send_response(HTTPStatus.OK)
             self.send_header(
@@ -1101,7 +1224,7 @@ class InventoryHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(output_bytes)
         except Exception as exc:
-            body = render_home(str(exc))
+            body = render_home(str(exc), mode="butler" if self.path == "/butler" else "foa")
             self.send_response(HTTPStatus.BAD_REQUEST)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1115,6 +1238,7 @@ class InventoryHandler(BaseHTTPRequestHandler):
 def run_server() -> None:
     server = ThreadingHTTPServer((HOST, PORT), InventoryHandler)
     print(f"Inventory app running at http://{HOST}:{PORT}")
+    threading.Timer(0.8, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()
     server.serve_forever()
 
 
