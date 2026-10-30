@@ -242,6 +242,13 @@ def clean_sku(value: object) -> str:
     return text
 
 
+def normalize_numeric_sku(value: object) -> str:
+    sku = clean_sku(value)
+    if sku.isdigit():
+        return sku.lstrip("0") or "0"
+    return sku
+
+
 def parse_quantity(value: object) -> float:
     if value is None:
         return 0.0
@@ -508,6 +515,7 @@ def build_updated_inventory_csv(
     template_path: str | None = None,
     target_location: str | None = TARGET_LOCATION,
     minimum_quantity: float = MIN_EXPORT_QTY,
+    normalize_numeric_skus: bool = False,
 ) -> bytes:
     if asset_file is None and template_path is not None:
         with open(template_path, "rb") as handle:
@@ -518,15 +526,26 @@ def build_updated_inventory_csv(
     writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
     writer.writeheader()
 
+    quantity_totals: dict[str, float] = totals
+    if normalize_numeric_skus:
+        normalized_totals: dict[str, float] = defaultdict(float)
+        for sku, quantity in totals.items():
+            normalized_totals[normalize_numeric_sku(sku)] += quantity
+        quantity_totals = normalized_totals
+
     for row in rows:
         location = clean_sku(row.get("Location"))
         if target_location is not None and location != target_location:
             continue
 
-        sku = clean_sku(row.get("SKU"))
+        sku = (
+            normalize_numeric_sku(row.get("SKU"))
+            if normalize_numeric_skus
+            else clean_sku(row.get("SKU"))
+        )
         available_value = normalize_text(row.get("Available (not editable)"))
         if target_location is None or available_value != NOT_STOCKED:
-            quantity = totals.get(sku, 0.0)
+            quantity = quantity_totals.get(sku, 0.0)
             if quantity < minimum_quantity:
                 quantity = 0.0
             row["On hand (new)"] = format_qty_for_export(quantity)
@@ -1205,14 +1224,18 @@ class InventoryHandler(BaseHTTPRequestHandler):
                     totals,
                     template_path=template_path,
                     target_location=None,
-                    minimum_quantity=0,
+                    minimum_quantity=MIN_EXPORT_QTY,
+                    normalize_numeric_skus=True,
                 )
                 today = datetime.now()
                 output_name = f"Butler_inventory_{today.day}_{today.strftime('%b').lower()}_{today.year}.csv"
             else:
                 output_bytes = build_updated_inventory_csv(totals, asset_file=asset_file)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_name = f"inventory_export_updated_{timestamp}.csv"
+                today = datetime.now()
+                output_name = (
+                    f"Furniture_of_America_inventory_{today.day}_"
+                    f"{today.strftime('%b').lower()}_{today.year}.csv"
+                )
 
             self.send_response(HTTPStatus.OK)
             self.send_header(
