@@ -32,9 +32,6 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Opening browser in 2 seconds...
-start "" powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 2; Start-Process 'http://127.0.0.1:8000'"
-
 echo Server is running at http://127.0.0.1:8000
 echo Close this window to stop the server.
 ".venv\Scripts\python.exe" app.py
