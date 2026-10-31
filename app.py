@@ -30,6 +30,8 @@ RUNTIME_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "fr
 BUNDLE_DIR = getattr(sys, "_MEIPASS", RUNTIME_DIR)
 ASSET_TEMPLATE = os.path.join(BUNDLE_DIR, "assets", "inventory_export_1.csv")
 BUTLER_ASSET_TEMPLATE = os.path.join(BUNDLE_DIR, "assets", "merged_inventory_export.csv")
+SHIPPING_DATA_PATH = os.path.join(BUNDLE_DIR, "assets", "shipping_info.csv")
+ORDER_NOTES_PATH = os.path.join(RUNTIME_DIR, "order_notes.json")
 BUTLER_EXTERNAL_TEMPLATE = os.path.join(
     os.path.dirname(os.path.dirname(BUNDLE_DIR)),
     "test FOA",
@@ -62,6 +64,102 @@ SKU_KEYWORDS = ("sku", "itemcode", "item code", "item", "product code", "product
 QTY_EXACT = ("qty", "quantity", "qty now", "stock qty", "available qty", "on hand qty")
 QTY_PARTIAL = ("qty", "quantity", "stock", "on hand", "available")
 SHOPIFY_RUNTIME_STATE: dict[str, str] = {}
+SHIPPING_RECORDS_CACHE: dict[str, dict[str, str]] | None = None
+ORDER_NOTES_LOCK = threading.Lock()
+
+
+def load_shipping_records() -> dict[str, dict[str, str]]:
+    global SHIPPING_RECORDS_CACHE
+    if SHIPPING_RECORDS_CACHE is not None:
+        return SHIPPING_RECORDS_CACHE
+
+    if not os.path.exists(SHIPPING_DATA_PATH):
+        raise ValueError("Shipping information data file was not found.")
+
+    records: dict[str, dict[str, str]] = {}
+    with open(SHIPPING_DATA_PATH, encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            sku = (row.get("sku") or "").strip().upper()
+            if sku:
+                records[sku] = {key: (value or "").strip() for key, value in row.items()}
+    SHIPPING_RECORDS_CACHE = records
+    return records
+
+
+def find_shipping_records(query: str) -> tuple[list[dict[str, str]], list[str]]:
+    normalized_query = query.strip().upper()
+    if not normalized_query:
+        return [], []
+
+    records = load_shipping_records()
+    exact = records.get(normalized_query)
+    if exact is None:
+        suggestions = [sku for sku in records if normalized_query in sku][:10]
+        return [], suggestions
+
+    results = [exact]
+    part_skus = [part.strip().upper() for part in exact.get("parts", "").split(",") if part.strip()]
+    results.extend(records[sku] for sku in part_skus if sku in records)
+    return results, []
+
+
+def _read_order_notes() -> list[dict[str, str]]:
+    if not os.path.exists(ORDER_NOTES_PATH):
+        return []
+    with open(ORDER_NOTES_PATH, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, list):
+        raise ValueError("Order notes data file is invalid.")
+    return [note for note in data if isinstance(note, dict)]
+
+
+def load_order_notes() -> list[dict[str, str]]:
+    with ORDER_NOTES_LOCK:
+        return _read_order_notes()
+
+
+def _write_order_notes(notes: list[dict[str, str]]) -> None:
+    temporary_path = f"{ORDER_NOTES_PATH}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(notes, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, ORDER_NOTES_PATH)
+
+
+def save_order_note(note_id: str, order_number: str, note_text: str) -> None:
+    clean_order_number = order_number.strip()[:200]
+    clean_note_text = note_text.strip()[:10000]
+    if not clean_note_text:
+        raise ValueError("Please write a note before saving.")
+
+    now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    with ORDER_NOTES_LOCK:
+        notes = _read_order_notes()
+        existing = next((note for note in notes if note.get("id") == note_id), None) if note_id else None
+        if existing is not None:
+            existing["order_number"] = clean_order_number
+            existing["note"] = clean_note_text
+            existing["updated_at"] = now
+        else:
+            notes.insert(
+                0,
+                {
+                    "id": hashlib.sha256(os.urandom(32)).hexdigest()[:16],
+                    "order_number": clean_order_number,
+                    "note": clean_note_text,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+        _write_order_notes(notes)
+
+
+def delete_order_note(note_id: str) -> None:
+    with ORDER_NOTES_LOCK:
+        notes = _read_order_notes()
+        filtered_notes = [note for note in notes if note.get("id") != note_id]
+        if len(filtered_notes) == len(notes):
+            raise ValueError("Order note was not found.")
+        _write_order_notes(filtered_notes)
 
 
 def load_dotenv_file(path: str) -> dict[str, str]:
@@ -807,6 +905,14 @@ def render_home(message: str = "", mode: str = "foa") -> bytes:
         <span class="menu-icon">B</span>
         <span>Butler Inventory</span>
       </a>
+      <a class="menu-item" href="/shipping">
+        <span class="menu-icon">S</span>
+        <span>Shipping Info</span>
+      </a>
+      <a class="menu-item" href="/order-notes">
+        <span class="menu-icon">N</span>
+        <span>Order Notes</span>
+      </a>
     </aside>
     <main class="content">
       <div class="panel">
@@ -828,6 +934,260 @@ def render_home(message: str = "", mode: str = "foa") -> bytes:
       </div>
     </main>
   </div>
+</body>
+</html>"""
+    return html_body.encode("utf-8")
+
+
+def render_shipping_page(query: str = "", error_message: str = "") -> bytes:
+    records: list[dict[str, str]] = []
+    suggestions: list[str] = []
+    if query and not error_message:
+        try:
+            records, suggestions = find_shipping_records(query)
+        except Exception as exc:
+            error_message = str(exc)
+
+    result_html = ""
+    if records:
+        cards = []
+        for index, record in enumerate(records):
+            sku = html.escape(record.get("sku", ""))
+            description = html.escape(record.get("description", "") or record.get("name", ""))
+            badge = "Selected SKU" if index == 0 else "Package / Component"
+
+            def display(field: str, suffix: str = "") -> str:
+                value = record.get(field, "")
+                return f"{html.escape(value)}{suffix}" if value else '<span class="missing">Not provided</span>'
+
+            cards.append(
+                f"""<article class="result-card">
+                  <div class="result-head">
+                    <div><span class="result-badge">{badge}</span><h2>{sku}</h2></div>
+                    <span class="item-type">{html.escape(record.get('item_type', ''))}</span>
+                  </div>
+                  <p class="description">{description}</p>
+                  <div class="measurements">
+                    <div><span>Length</span><strong>{display('length', ' in')}</strong></div>
+                    <div><span>Width</span><strong>{display('width', ' in')}</strong></div>
+                    <div><span>Height</span><strong>{display('height', ' in')}</strong></div>
+                    <div><span>Weight</span><strong>{display('weight', ' lb')}</strong></div>
+                  </div>
+                </article>"""
+            )
+        result_html = '<section class="results">' + "".join(cards) + "</section>"
+    elif query and suggestions:
+        links = "".join(
+            f'<a href="/shipping?sku={parse.quote(sku)}">{html.escape(sku)}</a>' for sku in suggestions
+        )
+        result_html = (
+            '<div class="empty"><strong>No exact SKU found.</strong>'
+            f'<p>Did you mean one of these?</p><div class="suggestions">{links}</div></div>'
+        )
+    elif query:
+        result_html = '<div class="empty"><strong>No matching SKU found.</strong><p>Check the SKU and try again.</p></div>'
+
+    error_html = f'<div class="error">{html.escape(error_message)}</div>' if error_message else ""
+    html_body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shipping Info | Gooddegg Management</title>
+  <style>
+    :root {{ --bg:#f6f7f4; --panel:rgba(255,255,255,.86); --text:#17201b; --muted:#66736c; --line:rgba(23,32,27,.09); --accent:#163f31; --soft:#edf3ef; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:"Segoe UI",Tahoma,sans-serif; color:var(--text); background:radial-gradient(circle at top left,rgba(22,63,49,.08),transparent 24%),linear-gradient(180deg,#f8faf8,#f3f5f2); }}
+    .wrap {{ min-height:100vh; display:grid; grid-template-columns:230px minmax(0,850px); justify-content:center; gap:24px; padding:32px 18px; }}
+    .sidebar {{ padding:24px 14px; border:1px solid rgba(255,255,255,.7); border-radius:24px; background:rgba(255,255,255,.7); box-shadow:0 18px 50px rgba(28,42,35,.06); }}
+    .brand {{ padding:8px 12px 24px; color:var(--accent); font-size:1.05rem; font-weight:700; }}
+    .menu-title {{ padding:0 12px 10px; color:var(--muted); font-size:.72rem; font-weight:700; letter-spacing:.1em; text-transform:uppercase; }}
+    .menu-item {{ display:flex; align-items:center; gap:10px; padding:12px; border-radius:14px; color:var(--accent); font-weight:600; text-decoration:none; }}
+    .menu-item.active {{ background:var(--soft); }}
+    .menu-icon {{ display:grid; width:28px; height:28px; place-items:center; border-radius:9px; background:var(--accent); color:white; font-size:.78rem; }}
+    main {{ min-width:0; }}
+    .panel {{ background:var(--panel); border:1px solid rgba(255,255,255,.65); border-radius:28px; padding:34px; box-shadow:0 18px 50px rgba(28,42,35,.08); }}
+    .label,.result-badge {{ display:inline-flex; padding:7px 12px; border-radius:999px; background:var(--soft); color:var(--accent); font-size:.76rem; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }}
+    h1 {{ margin:18px 0 10px; font-size:clamp(2rem,5vw,3rem); line-height:1.02; letter-spacing:-.04em; }}
+    .intro,.description {{ color:var(--muted); line-height:1.6; }}
+    form {{ display:flex; gap:10px; margin-top:24px; }}
+    input {{ flex:1; min-width:0; border:1px solid var(--line); border-radius:16px; padding:15px 17px; background:white; color:var(--text); font-size:1rem; text-transform:uppercase; outline:none; }}
+    input:focus {{ border-color:rgba(22,63,49,.45); box-shadow:0 0 0 4px rgba(22,63,49,.08); }}
+    button {{ border:0; border-radius:16px; padding:15px 22px; background:var(--accent); color:white; font-size:.98rem; font-weight:700; cursor:pointer; }}
+    .results {{ display:grid; gap:14px; margin-top:20px; }}
+    .result-card,.empty,.error {{ border:1px solid var(--line); border-radius:20px; padding:20px; background:rgba(255,255,255,.76); }}
+    .result-head {{ display:flex; align-items:start; justify-content:space-between; gap:14px; }}
+    .result-head h2 {{ margin:10px 0 0; font-size:1.35rem; }}
+    .item-type {{ color:var(--muted); font-size:.85rem; }}
+    .description {{ margin:8px 0 16px; }}
+    .measurements {{ display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }}
+    .measurements div {{ padding:14px; border-radius:14px; background:var(--soft); }}
+    .measurements span {{ display:block; margin-bottom:5px; color:var(--muted); font-size:.78rem; }}
+    .measurements strong {{ font-size:1.05rem; }}
+    .measurements .missing {{ margin:0; font-size:.83rem; font-weight:500; }}
+    .empty,.error {{ margin-top:20px; color:var(--muted); }}
+    .error {{ background:#fff3f2; color:#9a3b35; }}
+    .suggestions {{ display:flex; flex-wrap:wrap; gap:8px; }}
+    .suggestions a {{ padding:7px 10px; border-radius:10px; background:var(--soft); color:var(--accent); text-decoration:none; font-weight:600; }}
+    @media(max-width:760px) {{ .wrap {{ grid-template-columns:1fr; padding:18px 14px; }} .panel {{ padding:24px; }} .measurements {{ grid-template-columns:repeat(2,1fr); }} }}
+    @media(max-width:460px) {{ form {{ display:grid; }} .measurements {{ grid-template-columns:1fr 1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <aside class="sidebar">
+      <div class="brand">Gooddegg Management</div>
+      <div class="menu-title">Menu</div>
+      <a class="menu-item" href="/"><span class="menu-icon">F</span><span>FOA Inventory</span></a>
+      <a class="menu-item" href="/butler"><span class="menu-icon">B</span><span>Butler Inventory</span></a>
+      <a class="menu-item active" href="/shipping"><span class="menu-icon">S</span><span>Shipping Info</span></a>
+      <a class="menu-item" href="/order-notes"><span class="menu-icon">N</span><span>Order Notes</span></a>
+    </aside>
+    <main>
+      <div class="panel">
+        <span class="label">FOA Item Master</span>
+        <h1>Shipping Info</h1>
+        <p class="intro">Enter an exact SKU to view package length, width, height and weight. Group SKUs also show their component packages.</p>
+        <form method="get" action="/shipping">
+          <input type="search" name="sku" value="{html.escape(query)}" placeholder="e.g. FOA7730RD-BED" aria-label="SKU" autofocus required>
+          <button type="submit">Find SKU</button>
+        </form>
+        {error_html}
+        {result_html}
+      </div>
+    </main>
+  </div>
+</body>
+</html>"""
+    return html_body.encode("utf-8")
+
+
+def render_order_notes_page(message: str = "", message_kind: str = "") -> bytes:
+    notes: list[dict[str, str]] = []
+    try:
+        notes = load_order_notes()
+    except Exception as exc:
+        message = str(exc)
+        message_kind = "error"
+
+    note_cards = []
+    for note in notes:
+        note_id = html.escape(str(note.get("id", "")), quote=True)
+        order_number = html.escape(str(note.get("order_number", "")), quote=True)
+        note_text = html.escape(str(note.get("note", "")))
+        updated_at = html.escape(str(note.get("updated_at", "")))
+        note_cards.append(
+            f"""<article class="note-card">
+              <form method="post" action="/order-notes">
+                <input type="hidden" name="action" value="save">
+                <input type="hidden" name="note_id" value="{note_id}">
+                <div class="note-head">
+                  <input class="order-input" type="text" name="order_number" value="{order_number}" placeholder="Order number / title" maxlength="200">
+                  <span class="updated">Updated {updated_at}</span>
+                </div>
+                <textarea name="note" placeholder="Write order note..." maxlength="10000" required>{note_text}</textarea>
+                <div class="note-actions">
+                  <button class="save-button" type="submit">Save Note</button>
+                  <button class="delete-button" type="submit" name="action" value="delete" formnovalidate onclick="return confirm('Delete this note?')">Delete</button>
+                </div>
+              </form>
+            </article>"""
+        )
+
+    notes_html = "".join(note_cards)
+    if not notes_html:
+        notes_html = '<div class="empty-state" id="emptyState"><strong>No order notes yet.</strong><span>Click + Add to create your first note.</span></div>'
+
+    message_html = ""
+    if message:
+        message_html = f'<div class="message {html.escape(message_kind)}">{html.escape(message)}</div>'
+
+    html_body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Order Notes | Gooddegg Management</title>
+  <style>
+    :root {{ --panel:rgba(255,255,255,.86); --text:#17201b; --muted:#66736c; --line:rgba(23,32,27,.09); --accent:#163f31; --soft:#edf3ef; --danger:#a33d36; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:"Segoe UI",Tahoma,sans-serif; color:var(--text); background:radial-gradient(circle at top left,rgba(22,63,49,.08),transparent 24%),linear-gradient(180deg,#f8faf8,#f3f5f2); }}
+    .wrap {{ min-height:100vh; display:grid; grid-template-columns:230px minmax(0,850px); justify-content:center; gap:24px; padding:32px 18px; }}
+    .sidebar {{ padding:24px 14px; border:1px solid rgba(255,255,255,.7); border-radius:24px; background:rgba(255,255,255,.7); box-shadow:0 18px 50px rgba(28,42,35,.06); }}
+    .brand {{ padding:8px 12px 24px; color:var(--accent); font-size:1.05rem; font-weight:700; }}
+    .menu-title {{ padding:0 12px 10px; color:var(--muted); font-size:.72rem; font-weight:700; letter-spacing:.1em; text-transform:uppercase; }}
+    .menu-item {{ display:flex; align-items:center; gap:10px; padding:12px; border-radius:14px; color:var(--accent); font-weight:600; text-decoration:none; }}
+    .menu-item.active {{ background:var(--soft); }}
+    .menu-icon {{ display:grid; width:28px; height:28px; place-items:center; border-radius:9px; background:var(--accent); color:white; font-size:.78rem; }}
+    main {{ min-width:0; }}
+    .panel {{ background:var(--panel); border:1px solid rgba(255,255,255,.65); border-radius:28px; padding:34px; box-shadow:0 18px 50px rgba(28,42,35,.08); }}
+    .page-head {{ display:flex; justify-content:space-between; align-items:flex-start; gap:18px; }}
+    .label {{ display:inline-flex; padding:7px 12px; border-radius:999px; background:var(--soft); color:var(--accent); font-size:.76rem; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }}
+    h1 {{ margin:16px 0 8px; font-size:clamp(2rem,5vw,3rem); line-height:1.02; letter-spacing:-.04em; }}
+    .intro {{ margin:0; color:var(--muted); line-height:1.6; }}
+    button {{ border:0; cursor:pointer; font:inherit; font-weight:700; }}
+    .add-button {{ flex:none; padding:13px 20px; border-radius:15px; background:var(--accent); color:white; box-shadow:0 10px 24px rgba(22,63,49,.16); }}
+    .notes {{ display:grid; gap:14px; margin-top:24px; }}
+    .note-card,.new-note,.empty-state {{ padding:20px; border:1px solid var(--line); border-radius:20px; background:rgba(255,255,255,.78); }}
+    .new-note {{ display:none; border-color:rgba(22,63,49,.25); box-shadow:0 12px 28px rgba(22,63,49,.08); }}
+    .new-note.open {{ display:block; }}
+    .note-head {{ display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:12px; }}
+    .order-input {{ flex:1; min-width:0; border:0; border-bottom:1px solid var(--line); padding:9px 2px; background:transparent; color:var(--text); font-size:1.05rem; font-weight:700; outline:none; }}
+    .order-input:focus {{ border-color:var(--accent); }}
+    .updated {{ flex:none; color:var(--muted); font-size:.76rem; }}
+    textarea {{ display:block; width:100%; min-height:130px; resize:vertical; border:1px solid var(--line); border-radius:15px; padding:14px; background:#fff; color:var(--text); font:inherit; line-height:1.55; outline:none; }}
+    textarea:focus {{ border-color:rgba(22,63,49,.45); box-shadow:0 0 0 4px rgba(22,63,49,.07); }}
+    .note-actions {{ display:flex; gap:9px; justify-content:flex-end; margin-top:12px; }}
+    .save-button,.cancel-button,.delete-button {{ padding:10px 15px; border-radius:12px; }}
+    .save-button {{ background:var(--accent); color:white; }}
+    .cancel-button {{ background:var(--soft); color:var(--accent); }}
+    .delete-button {{ margin-right:auto; background:#fff2f1; color:var(--danger); }}
+    .empty-state {{ display:grid; gap:5px; place-items:center; min-height:145px; color:var(--muted); text-align:center; }}
+    .message {{ margin-top:20px; padding:13px 16px; border-radius:14px; background:var(--soft); color:var(--accent); }}
+    .message.error {{ background:#fff3f2; color:#9a3b35; }}
+    @media(max-width:760px) {{ .wrap {{ grid-template-columns:1fr; padding:18px 14px; }} .panel {{ padding:24px; }} .sidebar {{ min-height:auto; }} }}
+    @media(max-width:520px) {{ .page-head,.note-head {{ display:grid; }} .add-button {{ width:100%; }} .updated {{ order:-1; }} }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <aside class="sidebar">
+      <div class="brand">Gooddegg Management</div>
+      <div class="menu-title">Menu</div>
+      <a class="menu-item" href="/"><span class="menu-icon">F</span><span>FOA Inventory</span></a>
+      <a class="menu-item" href="/butler"><span class="menu-icon">B</span><span>Butler Inventory</span></a>
+      <a class="menu-item" href="/shipping"><span class="menu-icon">S</span><span>Shipping Info</span></a>
+      <a class="menu-item active" href="/order-notes"><span class="menu-icon">N</span><span>Order Notes</span></a>
+    </aside>
+    <main>
+      <div class="panel">
+        <div class="page-head">
+          <div><span class="label">Order Workspace</span><h1>Order Notes</h1><p class="intro">Keep order details, reminders and follow-up notes in one place.</p></div>
+          <button class="add-button" type="button" id="addNoteButton">+ Add</button>
+        </div>
+        {message_html}
+        <section class="notes">
+          <article class="new-note" id="newNote">
+            <form method="post" action="/order-notes">
+              <input type="hidden" name="action" value="save">
+              <input class="order-input" type="text" name="order_number" placeholder="Order number / title" maxlength="200" id="newOrderNumber">
+              <textarea name="note" placeholder="Write order note..." maxlength="10000" required></textarea>
+              <div class="note-actions"><button class="save-button" type="submit">Save Note</button><button class="cancel-button" type="button" id="cancelNoteButton">Cancel</button></div>
+            </form>
+          </article>
+          {notes_html}
+        </section>
+      </div>
+    </main>
+  </div>
+  <script>
+    const addButton = document.getElementById('addNoteButton');
+    const cancelButton = document.getElementById('cancelNoteButton');
+    const newNote = document.getElementById('newNote');
+    const orderInput = document.getElementById('newOrderNumber');
+    addButton.addEventListener('click', () => {{ newNote.classList.add('open'); orderInput.focus(); }});
+    cancelButton.addEventListener('click', () => {{ newNote.classList.remove('open'); newNote.querySelector('form').reset(); }});
+  </script>
 </body>
 </html>"""
     return html_body.encode("utf-8")
@@ -1116,6 +1476,31 @@ class InventoryHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if parsed_url.path == "/shipping":
+            query = parse.parse_qs(parsed_url.query).get("sku", [""])[-1].strip()
+            body = render_shipping_page(query=query)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if parsed_url.path == "/order-notes":
+            query = parse.parse_qs(parsed_url.query)
+            message = ""
+            if "saved" in query:
+                message = "Order note saved."
+            elif "deleted" in query:
+                message = "Order note deleted."
+            body = render_order_notes_page(message=message, message_kind="ok" if message else "")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if parsed_url.path == "/orders":
             query = parse.parse_qs(parsed_url.query)
             message = ""
@@ -1196,6 +1581,46 @@ class InventoryHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        parsed_path = parse.urlparse(self.path).path
+        if parsed_path == "/order-notes":
+            try:
+                content_type = self.headers.get("Content-Type", "")
+                if "application/x-www-form-urlencoded" not in content_type:
+                    raise ValueError("Invalid order note submission.")
+                content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length <= 0 or content_length > 1_000_000:
+                    raise ValueError("Order note submission is empty or too large.")
+                body = self.rfile.read(content_length).decode("utf-8")
+                fields = parse.parse_qs(body, keep_blank_values=True)
+                action = fields.get("action", ["save"])[-1]
+                note_id = fields.get("note_id", [""])[-1].strip()
+
+                if action == "delete":
+                    if not note_id:
+                        raise ValueError("Order note was not found.")
+                    delete_order_note(note_id)
+                    location = "/order-notes?deleted=1"
+                else:
+                    save_order_note(
+                        note_id,
+                        fields.get("order_number", [""])[-1],
+                        fields.get("note", [""])[-1],
+                    )
+                    location = "/order-notes?saved=1"
+
+                self.send_response(HTTPStatus.SEE_OTHER)
+                self.send_header("Location", location)
+                self.end_headers()
+                return
+            except Exception as exc:
+                body = render_order_notes_page(message=str(exc), message_kind="error")
+                self.send_response(HTTPStatus.BAD_REQUEST)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
         try:
             files, asset_file = parse_uploaded_files(self)
             is_butler = parse.urlparse(self.path).path == "/butler"

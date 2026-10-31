@@ -50,4 +50,8 @@ Keep the `assets` folder beside the EXE only if you want to replace the bundled 
 - Update `On hand (new)` in `assets/inventory_export_1.csv` for `Furniture of America` rows only
 - Download a new CSV file named like `inventory_export_updated_20260715_163000.csv`
 - Use the `Butler Inventory` menu to upload one Butler specialty product inventory CSV and download the mapped export
+- Use the `Shipping Info` menu to search any bundled FOA Item Master SKU for shipping length, width, height, and weight
+- Searching a group SKU also displays the shipping information for its component/package SKUs
+- Use the `Order Notes` menu to add, edit, save, and delete persistent order notes
+- Saved notes are stored beside the app in `order_notes.json`
 # Gooddegg_management

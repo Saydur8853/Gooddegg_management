@@ -3,3 +3,5 @@ Inventory_Report_East_2026-07-14.csv
 __pycache__/
 .venv/
 .env
+order_notes.json
+order_notes.json.tmp
